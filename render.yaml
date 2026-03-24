@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: noctyra-legit-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-render.txt
+    startCommand: uvicorn legit_server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ADMIN_API_KEY
+        sync: false
