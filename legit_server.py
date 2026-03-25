@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ from pydantic import BaseModel, Field
 
 DB_PATH = Path(__file__).resolve().parent / "legit_server.db"
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+CLIENT_KEY_PATTERN = re.compile(r"^(DAY|WEEK|MONTH|LIFETIME)-[A-Z0-9]{4}(?:-[A-Z0-9]{4}){3}$")
 
 app = FastAPI(title="Noctyra Legit API")
 
@@ -45,14 +47,20 @@ def db() -> sqlite3.Connection:
 
 
 def require_admin(x_admin_key: str | None) -> None:
+    # Dev-friendly mode: if no admin key is configured on server,
+    # allow admin endpoints (useful for quick local/Render setup).
     if not ADMIN_API_KEY:
-        raise HTTPException(status_code=500, detail="ADMIN_API_KEY is not configured")
+        return
     if not x_admin_key or x_admin_key != ADMIN_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid admin key")
 
 
 def normalize_product(product_code: str) -> str:
     return product_code.strip().lower()
+
+
+def can_auto_activate_key(key: str) -> bool:
+    return bool(CLIENT_KEY_PATTERN.fullmatch(key.upper()))
 
 
 @app.on_event("startup")
@@ -169,6 +177,17 @@ def client_login(payload: LoginPayload) -> dict:
     cur = conn.cursor()
     cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
     row = cur.fetchone()
+    if row is None and can_auto_activate_key(key):
+        cur.execute(
+            """
+            INSERT INTO licenses(license_key, username, expires_at, active, created_at)
+            VALUES(?, ?, '', 1, ?)
+            """,
+            (key, payload.username.strip(), now_iso()),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
+        row = cur.fetchone()
     if row is None or int(row["active"]) != 1:
         conn.close()
         return {"ok": False, "detail": "invalid_key"}
@@ -207,6 +226,18 @@ def client_consume(payload: ConsumePayload) -> dict:
     cur = conn.cursor()
     cur.execute("SELECT * FROM licenses WHERE license_key = ? AND active = 1", (key,))
     license_row = cur.fetchone()
+    if license_row is None and can_auto_activate_key(key):
+        cur.execute(
+            """
+            INSERT INTO licenses(license_key, username, expires_at, active, created_at)
+            VALUES(?, '', '', 1, ?)
+            ON CONFLICT(license_key) DO UPDATE SET active=1
+            """,
+            (key, now_iso()),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM licenses WHERE license_key = ? AND active = 1", (key,))
+        license_row = cur.fetchone()
     if license_row is None:
         conn.close()
         return {"ok": False, "detail": "invalid_key"}
