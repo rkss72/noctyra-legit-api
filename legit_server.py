@@ -147,17 +147,39 @@ def validate_or_activate_license(
         if row is None:
             return None, "invalid_key"
 
-    stored_hwid = (row["hwid"] or "").strip()
     db_key = str(row["license_key"])
-    if not stored_hwid:
-        cur.execute("UPDATE licenses SET hwid = ? WHERE license_key = ?", (incoming_hwid, db_key))
+    stored_hwid = (row["hwid"] or "").strip()
+
+    # Hard lock table: one license_key <-> one hwid
+    cur.execute("SELECT hwid FROM key_hwid WHERE license_key = ?", (db_key,))
+    lock_row = cur.fetchone()
+    if lock_row is None:
+        cur.execute(
+            "INSERT OR IGNORE INTO key_hwid(license_key, hwid) VALUES(?, ?)",
+            (db_key, incoming_hwid),
+        )
+        cur.connection.commit()
+        cur.execute("SELECT hwid FROM key_hwid WHERE license_key = ?", (db_key,))
+        lock_row = cur.fetchone()
+        if lock_row is None:
+            return None, "invalid_key"
+
+    locked_hwid = str(lock_row["hwid"]).strip()
+    if not locked_hwid:
+        cur.execute("UPDATE key_hwid SET hwid = ? WHERE license_key = ?", (incoming_hwid, db_key))
+        cur.connection.commit()
+        locked_hwid = incoming_hwid
+    elif locked_hwid != incoming_hwid:
+        return None, "hwid_mismatch"
+
+    # Keep legacy column synchronized for account display/compatibility.
+    if stored_hwid != locked_hwid:
+        cur.execute("UPDATE licenses SET hwid = ? WHERE license_key = ?", (locked_hwid, db_key))
         cur.connection.commit()
         cur.execute("SELECT * FROM licenses WHERE license_key = ?", (db_key,))
         row = cur.fetchone()
         if row is None:
             return None, "invalid_key"
-    elif stored_hwid != incoming_hwid:
-        return None, "hwid_mismatch"
 
     return row, ""
 
@@ -200,6 +222,14 @@ def startup() -> None:
             product_code TEXT NOT NULL,
             item_value TEXT NOT NULL,
             consumed_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS key_hwid (
+            license_key TEXT PRIMARY KEY,
+            hwid TEXT NOT NULL
         )
         """
     )
