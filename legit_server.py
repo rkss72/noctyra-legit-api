@@ -1,7 +1,7 @@
 import os
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
@@ -24,6 +24,7 @@ class AddLicensePayload(BaseModel):
 class LoginPayload(BaseModel):
     license_key: str
     username: str = ""
+    hwid: str = ""
 
 
 class RestockPayload(BaseModel):
@@ -34,10 +35,15 @@ class RestockPayload(BaseModel):
 class ConsumePayload(BaseModel):
     license_key: str
     product_code: str
+    hwid: str = ""
 
 
 def now_iso() -> str:
     return datetime.utcnow().isoformat()
+
+
+def normalize_key(value: str) -> str:
+    return value.strip().upper()
 
 
 def db() -> sqlite3.Connection:
@@ -63,6 +69,99 @@ def can_auto_activate_key(key: str) -> bool:
     return bool(CLIENT_KEY_PATTERN.fullmatch(key.upper()))
 
 
+def key_tier(key: str) -> str:
+    return key.strip().upper().split("-", 1)[0]
+
+
+def compute_expires_at_for_key(key: str, start: datetime | None = None) -> str:
+    start_dt = start or datetime.utcnow()
+    tier = key_tier(key)
+    if tier == "DAY":
+        return (start_dt + timedelta(days=1)).isoformat()
+    if tier == "WEEK":
+        return (start_dt + timedelta(days=7)).isoformat()
+    if tier == "MONTH":
+        return (start_dt + timedelta(days=30)).isoformat()
+    return ""
+
+
+def validate_or_activate_license(
+    cur: sqlite3.Cursor,
+    key: str,
+    wanted_username: str = "",
+    provided_hwid: str = "",
+) -> tuple[sqlite3.Row | None, str]:
+    key = normalize_key(key)
+    incoming_hwid = provided_hwid.strip()
+    if not incoming_hwid:
+        return None, "missing_hwid"
+
+    cur.execute("SELECT * FROM licenses WHERE UPPER(license_key) = ?", (key,))
+    row = cur.fetchone()
+
+    if row is None:
+        if not can_auto_activate_key(key):
+            return None, "invalid_key"
+        cur.execute(
+            """
+            INSERT INTO licenses(license_key, username, expires_at, active, hwid, created_at)
+            VALUES(?, ?, ?, 1, ?, ?)
+            """,
+            (key, wanted_username.strip(), compute_expires_at_for_key(key), incoming_hwid, now_iso()),
+        )
+        cur.connection.commit()
+        cur.execute("SELECT * FROM licenses WHERE UPPER(license_key) = ?", (key,))
+        row = cur.fetchone()
+        if row is None:
+            return None, "invalid_key"
+
+    if int(row["active"]) != 1:
+        return None, "invalid_key"
+
+    expires_at = (row["expires_at"] or "").strip()
+    if not expires_at and can_auto_activate_key(key):
+        expires_at = compute_expires_at_for_key(key)
+        cur.execute("UPDATE licenses SET expires_at = ? WHERE license_key = ?", (expires_at, key))
+        cur.connection.commit()
+        cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
+        row = cur.fetchone()
+        if row is None:
+            return None, "invalid_key"
+
+    expires_at = (row["expires_at"] or "").strip()
+    if expires_at:
+        try:
+            if datetime.utcnow() > datetime.fromisoformat(expires_at):
+                cur.execute("UPDATE licenses SET active = 0 WHERE UPPER(license_key) = ?", (key,))
+                cur.connection.commit()
+                return None, "expired_key"
+        except ValueError:
+            pass
+
+    db_key = str(row["license_key"])
+    if wanted_username and wanted_username != (row["username"] or ""):
+        cur.execute("UPDATE licenses SET username = ? WHERE license_key = ?", (wanted_username, db_key))
+        cur.connection.commit()
+        cur.execute("SELECT * FROM licenses WHERE license_key = ?", (db_key,))
+        row = cur.fetchone()
+        if row is None:
+            return None, "invalid_key"
+
+    stored_hwid = (row["hwid"] or "").strip()
+    db_key = str(row["license_key"])
+    if not stored_hwid:
+        cur.execute("UPDATE licenses SET hwid = ? WHERE license_key = ?", (incoming_hwid, db_key))
+        cur.connection.commit()
+        cur.execute("SELECT * FROM licenses WHERE license_key = ?", (db_key,))
+        row = cur.fetchone()
+        if row is None:
+            return None, "invalid_key"
+    elif stored_hwid != incoming_hwid:
+        return None, "hwid_mismatch"
+
+    return row, ""
+
+
 @app.on_event("startup")
 def startup() -> None:
     conn = db()
@@ -74,10 +173,15 @@ def startup() -> None:
             username TEXT NOT NULL DEFAULT '',
             expires_at TEXT NOT NULL DEFAULT '',
             active INTEGER NOT NULL DEFAULT 1,
+            hwid TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         )
         """
     )
+    cur.execute("PRAGMA table_info(licenses)")
+    cols = {str(row[1]).lower() for row in cur.fetchall()}
+    if "hwid" not in cols:
+        cur.execute("ALTER TABLE licenses ADD COLUMN hwid TEXT NOT NULL DEFAULT ''")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS stock_items (
@@ -111,7 +215,7 @@ def health() -> dict:
 @app.post("/admin/add-license")
 def admin_add_license(payload: AddLicensePayload, x_admin_key: str | None = Header(default=None)) -> dict:
     require_admin(x_admin_key)
-    key = payload.license_key.strip()
+    key = normalize_key(payload.license_key)
     if not key:
         raise HTTPException(status_code=400, detail="license_key required")
 
@@ -169,78 +273,39 @@ def admin_stock_count(x_admin_key: str | None = Header(default=None)) -> dict:
 
 @app.post("/client/login")
 def client_login(payload: LoginPayload) -> dict:
-    key = payload.license_key.strip()
+    key = normalize_key(payload.license_key)
     if not key:
         return {"ok": False, "detail": "missing_key"}
 
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
-    row = cur.fetchone()
-    if row is None and can_auto_activate_key(key):
-        cur.execute(
-            """
-            INSERT INTO licenses(license_key, username, expires_at, active, created_at)
-            VALUES(?, ?, '', 1, ?)
-            """,
-            (key, payload.username.strip(), now_iso()),
-        )
-        conn.commit()
-        cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
-        row = cur.fetchone()
-    if row is None or int(row["active"]) != 1:
+    row, detail = validate_or_activate_license(cur, key, payload.username.strip(), payload.hwid.strip())
+    if row is None:
         conn.close()
-        return {"ok": False, "detail": "invalid_key"}
+        return {"ok": False, "detail": detail or "invalid_key"}
 
     expires_at = (row["expires_at"] or "").strip()
-    if expires_at:
-        try:
-            if datetime.utcnow() > datetime.fromisoformat(expires_at):
-                conn.close()
-                return {"ok": False, "detail": "expired_key"}
-        except ValueError:
-            pass
-
-    wanted_username = payload.username.strip()
-    if wanted_username and wanted_username != (row["username"] or ""):
-        cur.execute("UPDATE licenses SET username = ? WHERE license_key = ?", (wanted_username, key))
-        conn.commit()
-
     conn.close()
     return {
         "ok": True,
-        "username": wanted_username or (row["username"] or ""),
+        "username": (row["username"] or ""),
         "expires_at": expires_at or "Lifetime",
     }
 
 
 @app.post("/client/consume")
 def client_consume(payload: ConsumePayload) -> dict:
-    key = payload.license_key.strip()
+    key = normalize_key(payload.license_key)
     product = normalize_product(payload.product_code)
     if not key or not product:
         return {"ok": False, "detail": "missing_fields"}
 
-    # validate key
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM licenses WHERE license_key = ? AND active = 1", (key,))
-    license_row = cur.fetchone()
-    if license_row is None and can_auto_activate_key(key):
-        cur.execute(
-            """
-            INSERT INTO licenses(license_key, username, expires_at, active, created_at)
-            VALUES(?, '', '', 1, ?)
-            ON CONFLICT(license_key) DO UPDATE SET active=1
-            """,
-            (key, now_iso()),
-        )
-        conn.commit()
-        cur.execute("SELECT * FROM licenses WHERE license_key = ? AND active = 1", (key,))
-        license_row = cur.fetchone()
+    license_row, detail = validate_or_activate_license(cur, key, provided_hwid=payload.hwid.strip())
     if license_row is None:
         conn.close()
-        return {"ok": False, "detail": "invalid_key"}
+        return {"ok": False, "detail": detail or "invalid_key"}
 
     # atomic consume
     cur.execute("BEGIN IMMEDIATE")
